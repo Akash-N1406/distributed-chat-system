@@ -1,0 +1,156 @@
+version: "3.9"
+
+# ============================================================
+#  DISTRIBUTED CHAT SYSTEM — Infrastructure
+#  Services: Redis, Zookeeper, Kafka, MongoDB, Kafka UI
+# ============================================================
+
+networks:
+  chat-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
+  redis-data:
+  kafka-data:
+
+services:
+
+  # ----------------------------------------------------------
+  # REDIS — Active user sessions + recent message cache
+  # Port: 6379
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: chat-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    networks:
+      - chat-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # ZOOKEEPER — Kafka's coordinator (manages brokers/topics)
+  # Port: 2181
+  # ----------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: chat-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - chat-network
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # KAFKA — Message queue for async message delivery
+  # Port: 9092 (internal), 29092 (external/host access)
+  # ----------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: chat-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168        # Keep messages 7 days
+      KAFKA_MESSAGE_MAX_BYTES: 10485760     # Max 10MB per message
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - chat-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # KAFKA UI — Visual dashboard to monitor topics & messages
+  # Port: 8090 → open http://localhost:8090
+  # ----------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: chat-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: chat-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - chat-network
+
+  # ----------------------------------------------------------
+  # MONGODB — Persistent storage for messages & users
+  # Port: 27017
+  # ----------------------------------------------------------
+  mongodb:
+    image: mongo:7
+    container_name: chat-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: chatadmin
+      MONGO_INITDB_ROOT_PASSWORD: chatpass123
+      MONGO_INITDB_DATABASE: chatdb
+    volumes:
+      - mongo-data:/data/db
+      - ./docker/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - chat-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # MONGO EXPRESS — Web UI to browse MongoDB
+  # Port: 8091 → open http://localhost:8091
+  # ----------------------------------------------------------
+  mongo-express:
+    image: mongo-express:latest
+    container_name: chat-mongo-express
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8091:8081"
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: chatadmin
+      ME_CONFIG_MONGODB_ADMINPASSWORD: chatpass123
+      ME_CONFIG_MONGODB_URL: mongodb://chatadmin:chatpass123@mongodb:27017/
+      ME_CONFIG_BASICAUTH: "false"
+    networks:
+      - chat-network
